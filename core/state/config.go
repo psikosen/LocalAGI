@@ -55,6 +55,7 @@ type AgentConfig struct {
 	LocalRAGURL         string `json:"local_rag_url" form:"local_rag_url"`
 	LocalRAGAPIKey      string `json:"local_rag_api_key" form:"local_rag_api_key"`
 	OllamaServiceURL    string `json:"ollama_service_url,omitempty" form:"ollama_service_url"`
+	OllamaServiceAPIKey string `json:"ollama_service_api_key,omitempty" form:"ollama_service_api_key"`
 	LastMessageDuration string `json:"last_message_duration" form:"last_message_duration"`
 
 	Name                  string `json:"name" form:"name"`
@@ -167,6 +168,14 @@ func NewAgentConfigMeta(
 				Type:         "text",
 				DefaultValue: "",
 				HelpText:     "Base URL of the external Ollama Python service (e.g., http://localhost:8000). If set, this will be used for chat and tool calls.",
+				Tags:         config.Tags{Section: "ModelSettings"},
+			},
+			{
+				Name:         "ollama_service_api_key",
+				Label:        "Ollama Service API Key",
+				Type:         "password",
+				DefaultValue: "",
+				HelpText:     "Optional API key for the external Ollama Python service. If the service requires an API key, enter it here.",
 				Tags:         config.Tags{Section: "ModelSettings"},
 			},
 			{

@@ -18,6 +18,8 @@ import (
 	"github.com/mudler/LocalAGI/core/types"
 	"github.com/mudler/LocalAGI/pkg/llm"
 	"github.com/mudler/LocalAGI/pkg/xlog"
+	"bufio"
+
 	"github.com/sashabaranov/go-openai"
 	"github.com/sashabaranov/go-openai/jsonschema"
 )
@@ -28,6 +30,16 @@ const (
 	SystemRole    = "system"
 	maxRetries    = 5
 )
+
+// OllamaSSEEvent defines the structure for events from the Ollama service stream
+type OllamaSSEEvent struct {
+	Type          string                 `json:"type"`
+	Content       string                 `json:"content,omitempty"`        // For text_chunk
+	ToolName      string                 `json:"tool_name,omitempty"`      // For tool_call
+	ToolArguments map[string]interface{} `json:"tool_arguments,omitempty"` // For tool_call
+	Detail        string                 `json:"detail,omitempty"`         // For error
+	StatusCode    int                    `json:"status_code,omitempty"`    // For error
+}
 
 var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 
@@ -319,78 +331,151 @@ func (a *Agent) askLLM(ctx context.Context, conversation []openai.ChatCompletion
 		return openai.ChatCompletionMessage{}, fmt.Errorf("error marshalling ollama request: %w", err)
 	}
 
-	var ollamaResponse types.OllamaChatResponse
 	var httpResponse *http.Response
+	var err error // Declare err here to be accessible for the final error check
 
-	httpClient := &http.Client{Timeout: a.options.timeoutDuration()} // Assuming timeoutDuration() is a method on options or a way to get time.Duration
+	httpClient := &http.Client{Timeout: a.options.timeoutDuration()}
+	ollamaServiceFullURL := a.options.OllamaServiceURL + "/chat" // Define for logging
 
+	// Log before making the HTTP POST request
+	xlog.Debug("Making HTTP POST request to Python Ollama service",
+		"url", ollamaServiceFullURL,
+		"model", ollamaRequest.ModelName, // Assuming ollamaRequest is the marshalled request body variable
+		"apiKeySet", a.options.OllamaServiceAPIKey != "")
+
+	// Retry loop for making the initial HTTP request
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, "POST", a.options.OllamaServiceURL+"/chat", bytes.NewBuffer(requestBody))
+		var req *http.Request
+		req, err = http.NewRequestWithContext(ctx, "POST", ollamaServiceFullURL, bytes.NewBuffer(requestBody))
 		if err != nil {
 			return openai.ChatCompletionMessage{}, fmt.Errorf("error creating ollama http request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream") // Request SSE
+		if a.options.OllamaServiceAPIKey != "" {
+			req.Header.Set("X-API-Key", a.options.OllamaServiceAPIKey)
+		}
 
 		httpResponse, err = httpClient.Do(req)
 		if err == nil {
-			defer httpResponse.Body.Close()
+			// If status is OK, break from retry loop to process response.
+			// If not OK, we might retry if it's a transient issue, or handle specific errors.
 			if httpResponse.StatusCode == http.StatusOK {
-				if err := json.NewDecoder(httpResponse.Body).Decode(&ollamaResponse); err == nil {
-					// Successfully decoded
-					if ollamaResponse.Error != "" {
-						xlog.Warn("Ollama service returned an error in response", "attempt", attempt+1, "error", ollamaResponse.Error)
-						// continue to retry if there's an error in the response body
-					} else {
-						break // Success
-					}
-				} else {
-					xlog.Warn("Error decoding ollama response, retrying", "attempt", attempt+1, "decode_error", err, "status_code", httpResponse.StatusCode)
-				}
-			} else {
-				xlog.Warn("Ollama service returned non-OK status, retrying", "attempt", attempt+1, "status_code", httpResponse.StatusCode)
-				// Consume body to allow connection reuse
-				// io.Copy(io.Discard, httpResponse.Body) // Not strictly necessary for retry here as we close, but good practice
+				break // Successfully made request, proceed to process response
 			}
+			// If status is not OK, close body and decide if retryable
+			httpResponse.Body.Close() // Close body before potential retry
+			xlog.Warn("Ollama service returned non-OK status", "attempt", attempt+1, "status_code", httpResponse.StatusCode)
+			// You might want to add more sophisticated retry logic based on status codes here
 		} else {
-			xlog.Warn("Error making ollama http request, retrying", "attempt", attempt+1, "http_error", err)
+			xlog.Warn("Error making ollama http request", "attempt", attempt+1, "http_error", err)
 		}
 
 		if attempt < maxRetries {
-			time.Sleep(2 * time.Second) // Optional: Add a delay between retries
+			time.Sleep(2 * time.Second)
 		}
 	}
 
-	if err != nil { // This err is from the last attempt of httpClient.Do or json.NewDecoder
-		return openai.ChatCompletionMessage{}, fmt.Errorf("failed to get valid response from ollama service after %d retries: %w", maxRetries+1, err)
+	// After retry loop, if err is still not nil, it means all retries failed.
+	if err != nil {
+		return openai.ChatCompletionMessage{}, fmt.Errorf("failed to make http request to ollama service after %d retries: %w", maxRetries+1, err)
 	}
-	if ollamaResponse.Error != "" { // Check error from response body after retries
-		return openai.ChatCompletionMessage{}, fmt.Errorf("ollama service error: %s", ollamaResponse.Error)
-	}
+	// Ensure the body is closed if we exit due to an error after this point,
+	// or after successful processing.
+	defer httpResponse.Body.Close()
 
+	// Check Content-Type for SSE
+	if strings.HasPrefix(httpResponse.Header.Get("Content-Type"), "text/event-stream") {
+		scanner := bufio.NewScanner(httpResponse.Body)
+		var accumulatedText strings.Builder
+		var accumulatedToolCalls []openai.ToolCall
 
-	// Process the response
-	if ollamaResponse.Type == "text" {
-		return openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: ollamaResponse.Content}, nil
-	} else if ollamaResponse.Type == "tool_call" && ollamaResponse.ToolCall != nil {
-		argumentsJSONString, err := json.Marshal(ollamaResponse.ToolCall.ToolArguments)
-		if err != nil {
-			return openai.ChatCompletionMessage{}, fmt.Errorf("error marshalling tool arguments: %w", err)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data: ") {
+				jsonData := strings.TrimPrefix(line, "data: ")
+				if jsonData == "" { // Skip empty data lines if any
+					continue
+				}
+
+				var event OllamaSSEEvent
+				if err := json.Unmarshal([]byte(jsonData), &event); err != nil {
+					xlog.Error("Error unmarshalling SSE event from Ollama service", "data", jsonData, "error", err)
+					return openai.ChatCompletionMessage{}, fmt.Errorf("error unmarshalling SSE event '%s': %w", jsonData, err)
+				}
+				xlog.Debug("Received SSE event from Ollama service", "type", event.Type)
+
+				switch event.Type {
+				case "text_chunk":
+					xlog.Debug("SSE text_chunk content", "content", event.Content) // Optional, can be verbose
+					accumulatedText.WriteString(event.Content)
+				case "tool_call":
+					xlog.Info("SSE tool_call event", "toolName", event.ToolName, "arguments", event.ToolArguments)
+					argsJSON, err := json.Marshal(event.ToolArguments)
+					if err != nil {
+						return openai.ChatCompletionMessage{}, fmt.Errorf("error marshalling tool arguments for %s: %w", event.ToolName, err)
+					}
+					toolCallID := fmt.Sprintf("call_%s", randStringRunes(10))
+					accumulatedToolCalls = append(accumulatedToolCalls, openai.ToolCall{
+						ID:   toolCallID,
+						Type: openai.ToolTypeFunction,
+						Function: openai.FunctionCall{
+							Name:      event.ToolName,
+							Arguments: string(argsJSON),
+						},
+					})
+				case "error":
+					xlog.Error("SSE error event from Ollama service", "statusCode", event.StatusCode, "detail", event.Detail)
+					return openai.ChatCompletionMessage{}, fmt.Errorf("ollama service error (status %d): %s", event.StatusCode, event.Detail)
+				default:
+					xlog.Warn("Received unknown SSE event type from Ollama service", "type", event.Type)
+				}
+			}
 		}
-		toolCallID := fmt.Sprintf("call_%s", randStringRunes(8))
-		return openai.ChatCompletionMessage{
-			Role: openai.ChatMessageRoleAssistant,
-			ToolCalls: []openai.ToolCall{{
-				ID:   toolCallID,
-				Type: openai.ToolTypeFunction,
-				Function: openai.FunctionCall{
-					Name:      ollamaResponse.ToolCall.ToolName,
-					Arguments: string(argumentsJSONString),
-				},
-			}},
-		}, nil
-	}
 
-	return openai.ChatCompletionMessage{}, fmt.Errorf("unexpected ollama response type or structure: %+v", ollamaResponse)
+		if err := scanner.Err(); err != nil {
+			return openai.ChatCompletionMessage{}, fmt.Errorf("error reading SSE stream from ollama service: %w", err)
+		}
+
+		// After processing all events
+		if len(accumulatedToolCalls) > 0 {
+			xlog.Info("Successfully assembled tool calls from Ollama SSE stream", "numToolCalls", len(accumulatedToolCalls))
+			return openai.ChatCompletionMessage{
+				Role:      openai.ChatMessageRoleAssistant,
+				ToolCalls: accumulatedToolCalls,
+			}, nil
+		}
+		if accumulatedText.Len() > 0 {
+			xlog.Info("Successfully assembled text response from Ollama SSE stream", "textLength", accumulatedText.Len())
+			return openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleAssistant,
+				Content: accumulatedText.String(),
+			}, nil
+		}
+		return openai.ChatCompletionMessage{}, fmt.Errorf("ollama service returned empty or malformed SSE stream")
+
+	} else {
+		contentType := httpResponse.Header.Get("Content-Type")
+		xlog.Warn("Received non-SSE response from Ollama service, attempting to decode as JSON error", "contentType", contentType)
+		var ollamaErrorResponse struct {
+			Error  string `json:"error"`
+			Detail string `json:"detail"`
+		}
+		if err := json.NewDecoder(httpResponse.Body).Decode(&ollamaErrorResponse); err != nil {
+			xlog.Error("Failed to decode non-SSE error response from Ollama service", "decodeError", err, "statusCode", httpResponse.StatusCode)
+			return openai.ChatCompletionMessage{}, fmt.Errorf("ollama service returned non-SSE and non-JSON error response (status %d)", httpResponse.StatusCode)
+		}
+		
+		errorMsg := ollamaErrorResponse.Error
+		if errorMsg == "" {
+			errorMsg = ollamaErrorResponse.Detail
+		}
+		if errorMsg == "" {
+			errorMsg = fmt.Sprintf("ollama service returned status %d with no specific error message", httpResponse.StatusCode)
+		}
+		xlog.Error("Decoded JSON error from Ollama service", "error", errorMsg, "statusCode", httpResponse.StatusCode)
+		return openai.ChatCompletionMessage{}, fmt.Errorf("ollama service error: %s", errorMsg)
+	}
 }
 
 var ErrContextCanceled = fmt.Errorf("context canceled")

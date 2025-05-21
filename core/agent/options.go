@@ -21,6 +21,7 @@ type llmOptions struct {
 type options struct {
 	LLMAPI                                                                                       llmOptions
 	OllamaServiceURL                                                                             string
+	OllamaServiceAPIKey                                                                          string
 	character                                                                                    Character
 	randomIdentityGuidance                                                                       string
 	randomIdentity                                                                               bool
@@ -72,6 +73,13 @@ type options struct {
 func WithOllamaServiceURL(url string) Option {
 	return func(o *options) error {
 		o.OllamaServiceURL = url
+		return nil
+	}
+}
+
+func WithOllamaServiceAPIKey(apiKey string) Option {
+	return func(o *options) error {
+		o.OllamaServiceAPIKey = apiKey
 		return nil
 	}
 }

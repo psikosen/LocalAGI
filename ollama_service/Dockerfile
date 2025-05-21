@@ -16,8 +16,10 @@ COPY main.py .
 # Make port 8000 available to the world outside this container
 EXPOSE 8000
 
-# Define environment variable
-ENV OLLAMA_HOST="0.0.0.0"
+# Define environment variables
+ENV OLLAMA_HOST_URL="http://localhost:11434" 
+ENV OLLAMA_HOST="0.0.0.0" # For Uvicorn server binding
+ENV OLLAMA_SERVICE_API_KEY="" # Optional API key for the service, auth disabled by default
 
 # Run main.py when the container launches
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

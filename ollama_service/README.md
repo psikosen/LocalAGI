@@ -51,6 +51,27 @@ The service uses FastAPI, Uvicorn, Ollama-Python, and Instructor. Dependencies a
     ```
     The service will be available at `http://localhost:8000`.
 
+## Configuration
+
+-   `OLLAMA_HOST_URL`: Specifies the URL of the Ollama instance the service should connect to.
+    -   Defaults to `http://localhost:11434`.
+    -   You can override this when running the Docker container, e.g.:
+        ```bash
+        docker run -e OLLAMA_HOST_URL="http://my_ollama_server:11434" -p 8000:8000 localagi-ollama-service
+        ```
+    -   If running with Uvicorn directly, set the environment variable in your shell:
+        ```bash
+        export OLLAMA_HOST_URL="http://my_ollama_server:11434"
+        uvicorn main:app --host 0.0.0.0 --port 8000
+        ```
+-   `OLLAMA_SERVICE_API_KEY`: (Optional) An API key to secure the service.
+    -   Defaults to empty (no authentication).
+    -   If set, clients must send this key in the `X-API-Key` header.
+    -   Example Docker override:
+        ```bash
+        docker run -e OLLAMA_SERVICE_API_KEY="your_secret_key" -e OLLAMA_HOST_URL="http://my_ollama_server:11434" -p 8000:8000 localagi-ollama-service
+        ```
+
 ## API
 
 The service exposes one main endpoint:
