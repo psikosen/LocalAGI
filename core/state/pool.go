@@ -569,6 +569,10 @@ func (a *AgentPool) startAgentWithConfig(name string, config *AgentConfig, obs O
 		}
 	}
 
+	if config.OllamaServiceURL != "" {
+		opts = append(opts, WithOllamaServiceURL(config.OllamaServiceURL))
+	}
+
 	xlog.Info("Starting agent", "name", name, "config", config)
 
 	agent, err := New(opts...)

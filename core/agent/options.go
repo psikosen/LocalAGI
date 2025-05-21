@@ -20,6 +20,7 @@ type llmOptions struct {
 
 type options struct {
 	LLMAPI                                                                                       llmOptions
+	OllamaServiceURL                                                                             string
 	character                                                                                    Character
 	randomIdentityGuidance                                                                       string
 	randomIdentity                                                                               bool
@@ -66,6 +67,13 @@ type options struct {
 	parallelJobs int
 
 	lastMessageDuration time.Duration
+}
+
+func WithOllamaServiceURL(url string) Option {
+	return func(o *options) error {
+		o.OllamaServiceURL = url
+		return nil
+	}
 }
 
 func (o *options) SeparatedMultimodalModel() bool {

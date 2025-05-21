@@ -1,21 +1,25 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/mudler/LocalAGI/pkg/xlog"
-
 	"github.com/mudler/LocalAGI/core/action"
 	"github.com/mudler/LocalAGI/core/types"
 	"github.com/mudler/LocalAGI/pkg/llm"
+	"github.com/mudler/LocalAGI/pkg/xlog"
 	"github.com/sashabaranov/go-openai"
+	"github.com/sashabaranov/go-openai/jsonschema"
 )
 
 const (
@@ -24,6 +28,23 @@ const (
 	SystemRole    = "system"
 	maxRetries    = 5
 )
+
+var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+func randStringRunes(n int) string {
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letterRunes[r.Intn(len(letterRunes))]
+	}
+	return string(b)
+}
+
+var r *rand.Rand
+
+func init() {
+	// Initialize the random number generator
+	r = rand.New(rand.NewSource(time.Now().UnixNano()))
+}
 
 type Agent struct {
 	sync.Mutex
@@ -219,38 +240,174 @@ func (a *Agent) Enqueue(j *types.Job) {
 	a.jobQueue <- j
 }
 
+func (a *Agent) convertJSonSchemaToOllamaParams(schema jsonschema.Definition) types.OllamaToolParameters {
+	ollamaParams := types.OllamaToolParameters{
+		Type:       string(schema.Type), // jsonschema.Object
+		Properties: make(map[string]types.OllamaToolParameterProperty),
+		Required:   schema.Required,
+	}
+	for name, prop := range schema.Properties {
+		ollamaParams.Properties[name] = types.OllamaToolParameterProperty{
+			Type:        string(prop.Type), // e.g., jsonschema.String, jsonschema.Number
+			Description: prop.Description,
+		}
+	}
+	return ollamaParams
+}
+
 func (a *Agent) askLLM(ctx context.Context, conversation []openai.ChatCompletionMessage, maxRetries int) (openai.ChatCompletionMessage, error) {
-	var resp openai.ChatCompletionResponse
-	var err error
+	if a.options.OllamaServiceURL == "" {
+		// Fallback to original OpenAI client if OllamaServiceURL is not set
+		xlog.Debug("OllamaServiceURL not set, falling back to direct OpenAI call")
+		var resp openai.ChatCompletionResponse
+		var err error
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			resp, err = a.client.CreateChatCompletion(ctx,
+				openai.ChatCompletionRequest{
+					Model:    a.options.LLMAPI.Model,
+					Messages: conversation,
+					// Tools: TODO: How to handle tools for direct OpenAI calls if needed?
+					// For now, assuming this path is for non-tool interactions or models without tool support if Ollama is primary.
+				},
+			)
+			if err == nil && len(resp.Choices) > 0 && resp.Choices[0].Message.Content != "" {
+				return resp.Choices[0].Message, nil
+			}
+			if err == nil && len(resp.Choices) > 0 && len(resp.Choices[0].Message.ToolCalls) > 0 {
+				return resp.Choices[0].Message, nil
+			}
+			xlog.Warn("Error asking LLM (OpenAI fallback), retrying", "attempt", attempt+1, "error", err)
+			if attempt < maxRetries {
+				time.Sleep(2 * time.Second)
+			}
+		}
+		if err != nil {
+			return openai.ChatCompletionMessage{}, fmt.Errorf("openai fallback error: %w", err)
+		}
+		if len(resp.Choices) == 0 {
+			return openai.ChatCompletionMessage{}, fmt.Errorf("openai fallback: no choices in response")
+		}
+		return resp.Choices[0].Message, nil
+	}
+
+	xlog.Debug("Using Ollama service for LLM call", "url", a.options.OllamaServiceURL)
+
+	// Construct OllamaChatRequest
+	ollamaTools := []types.OllamaToolDefinition{}
+	availableActions := a.availableActions() // Assuming this method provides []types.Action
+	for _, action := range availableActions {
+		def := action.Definition() // Assuming this returns types.ActionDefinition
+		if def.Parameters == nil { // Ensure parameters is not nil
+			xlog.Debug("Skipping tool due to nil parameters", "tool", def.Name)
+			continue
+		}
+		ollamaTools = append(ollamaTools, types.OllamaToolDefinition{
+			Name:        def.Name.String(),
+			Description: def.Description,
+			Parameters:  a.convertJSonSchemaToOllamaParams(*def.Parameters),
+		})
+	}
+
+	ollamaRequest := types.OllamaChatRequest{
+		ConversationHistory: conversation,
+		Tools:               ollamaTools,
+		ModelName:           a.options.LLMAPI.Model,
+	}
+
+	requestBody, err := json.Marshal(ollamaRequest)
+	if err != nil {
+		return openai.ChatCompletionMessage{}, fmt.Errorf("error marshalling ollama request: %w", err)
+	}
+
+	var ollamaResponse types.OllamaChatResponse
+	var httpResponse *http.Response
+
+	httpClient := &http.Client{Timeout: a.options.timeoutDuration()} // Assuming timeoutDuration() is a method on options or a way to get time.Duration
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		resp, err = a.client.CreateChatCompletion(ctx,
-			openai.ChatCompletionRequest{
-				Model:    a.options.LLMAPI.Model,
-				Messages: conversation,
-			},
-		)
-		if err == nil && len(resp.Choices) == 1 && resp.Choices[0].Message.Content != "" {
-			break
+		req, err := http.NewRequestWithContext(ctx, "POST", a.options.OllamaServiceURL+"/chat", bytes.NewBuffer(requestBody))
+		if err != nil {
+			return openai.ChatCompletionMessage{}, fmt.Errorf("error creating ollama http request: %w", err)
 		}
-		xlog.Warn("Error asking LLM, retrying", "attempt", attempt+1, "error", err)
+		req.Header.Set("Content-Type", "application/json")
+
+		httpResponse, err = httpClient.Do(req)
+		if err == nil {
+			defer httpResponse.Body.Close()
+			if httpResponse.StatusCode == http.StatusOK {
+				if err := json.NewDecoder(httpResponse.Body).Decode(&ollamaResponse); err == nil {
+					// Successfully decoded
+					if ollamaResponse.Error != "" {
+						xlog.Warn("Ollama service returned an error in response", "attempt", attempt+1, "error", ollamaResponse.Error)
+						// continue to retry if there's an error in the response body
+					} else {
+						break // Success
+					}
+				} else {
+					xlog.Warn("Error decoding ollama response, retrying", "attempt", attempt+1, "decode_error", err, "status_code", httpResponse.StatusCode)
+				}
+			} else {
+				xlog.Warn("Ollama service returned non-OK status, retrying", "attempt", attempt+1, "status_code", httpResponse.StatusCode)
+				// Consume body to allow connection reuse
+				// io.Copy(io.Discard, httpResponse.Body) // Not strictly necessary for retry here as we close, but good practice
+			}
+		} else {
+			xlog.Warn("Error making ollama http request, retrying", "attempt", attempt+1, "http_error", err)
+		}
+
 		if attempt < maxRetries {
 			time.Sleep(2 * time.Second) // Optional: Add a delay between retries
 		}
 	}
 
-	if err != nil {
-		return openai.ChatCompletionMessage{}, err
+	if err != nil { // This err is from the last attempt of httpClient.Do or json.NewDecoder
+		return openai.ChatCompletionMessage{}, fmt.Errorf("failed to get valid response from ollama service after %d retries: %w", maxRetries+1, err)
+	}
+	if ollamaResponse.Error != "" { // Check error from response body after retries
+		return openai.ChatCompletionMessage{}, fmt.Errorf("ollama service error: %s", ollamaResponse.Error)
 	}
 
-	if len(resp.Choices) != 1 {
-		return openai.ChatCompletionMessage{}, fmt.Errorf("not enough choices: %w", err)
+
+	// Process the response
+	if ollamaResponse.Type == "text" {
+		return openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: ollamaResponse.Content}, nil
+	} else if ollamaResponse.Type == "tool_call" && ollamaResponse.ToolCall != nil {
+		argumentsJSONString, err := json.Marshal(ollamaResponse.ToolCall.ToolArguments)
+		if err != nil {
+			return openai.ChatCompletionMessage{}, fmt.Errorf("error marshalling tool arguments: %w", err)
+		}
+		toolCallID := fmt.Sprintf("call_%s", randStringRunes(8))
+		return openai.ChatCompletionMessage{
+			Role: openai.ChatMessageRoleAssistant,
+			ToolCalls: []openai.ToolCall{{
+				ID:   toolCallID,
+				Type: openai.ToolTypeFunction,
+				Function: openai.FunctionCall{
+					Name:      ollamaResponse.ToolCall.ToolName,
+					Arguments: string(argumentsJSONString),
+				},
+			}},
+		}, nil
 	}
 
-	return resp.Choices[0].Message, nil
+	return openai.ChatCompletionMessage{}, fmt.Errorf("unexpected ollama response type or structure: %+v", ollamaResponse)
 }
 
 var ErrContextCanceled = fmt.Errorf("context canceled")
+
+// Helper function to get timeout duration from options.timeout (string)
+// This is an assumed helper. If options.timeout is already time.Duration, this is not needed.
+func (o *options) timeoutDuration() time.Duration {
+	if o.timeout == "" {
+		return 30 * time.Second // Default timeout
+	}
+	d, err := time.ParseDuration(o.timeout)
+	if err != nil {
+		xlog.Warn("Failed to parse timeout string, using default", "timeout_string", o.timeout, "error", err)
+		return 30 * time.Second
+	}
+	return d
+}
 
 func (a *Agent) Stop() {
 	a.Lock()
